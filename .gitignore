@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Runtime artifacts
+pain_signals/processed/
+logs/*.jsonl
+checkpoints/
+*.jsonl
+!pain_log.jsonl
+
+# State files
+autonomic_state.json
+respiratory_state.json
+core_checksums.json
