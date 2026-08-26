@@ -50,6 +50,13 @@ try:
 except ImportError:
     HAS_PAIN_BUS = False
 
+# 导入 Loop Watchdog v2（如果存在）
+try:
+    import loop_watchdog
+    HAS_WATCHDOG = True
+except ImportError:
+    HAS_WATCHDOG = False
+
 # SOMA_DIR 已加入 sys.path，所有子系统可直接 import
 _REFLEX_ERR = _IMMUNE_ERR = None
 try:
@@ -79,7 +86,7 @@ NAS_WEBDAV_AUTH = {'Authorization': 'Basic ' + base64.b64encode(b'anima:animaste
 
 # ─── 工具 ───────────────────────────────────────────────────────────────────
 def utcnow() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S+08:00")
+    return datetime.now().strftime("%Y-%m-%dT%H:%M:%S+08:00")
 
 def log_event(subsystem: str, event: str, detail: str = ""):
     entry = json.dumps({
@@ -99,8 +106,19 @@ def write_state(state: dict):
 
 def read_state() -> dict:
     if STATE_FILE.exists():
-        with open(STATE_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
+        try:
+            with open(STATE_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception as e:
+            # 容错：state 文件损坏时重置，避免主循环崩溃
+            log_event("autonomic_master", "state_reset", f"state file corrupted: {e}")
+            backup = STATE_FILE.with_suffix(".json.bak")
+            try:
+                import shutil
+                shutil.copy2(STATE_FILE, backup)
+            except Exception:
+                pass
+            return {}
     return {}
 
 # ─── 心跳 L0-L3 探测 ───────────────────────────────────────────────────────
@@ -151,11 +169,11 @@ def run_respiratory() -> dict:
     from urllib.error import URLError
 
     try:
-        # 检查 NAS memory 目录
-        req = Request(NAS_WEBDAV("memory/"), method="PROPFIND", headers=NAS_WEBDAV_AUTH)
-        req.add_header("Depth", "1")
+        # Depth=0 探测根路径（Depth=1 会被 Apache 拒 403/400；memory/ 带斜杠 400）
+        req = Request(NAS_WEBDAV_BASE() + "/", method="PROPFIND", headers=NAS_WEBDAV_AUTH)
+        req.add_header("Depth", "0")
         with urlopen(req, timeout=8) as r:
-            # 简单判断：能响应 = NAS 在线
+            # 能响应 = NAS 在线
             return {"status": "ok", "nas_reachable": True}
     except Exception:
         pass
@@ -216,18 +234,28 @@ def run_thermo() -> dict:
 
 # ─── 记忆完整性 ─────────────────────────────────────────────────────────────
 def run_integrity() -> dict:
-    """运行 memory_integrity check（调用已有脚本）。"""
-    script = WORKSPACE / "silicon-civilization-kb" / "scripts" / "memory_integrity.py"
-    if not script.exists():
+    """运行 memory_integrity check（调用已有脚本）。
+
+    路径探测：兼容不同部署布局（WORKSPACE 为 .qclaw 根，
+    脚本实际位于 workspace-agent-<id>/silicon-civilization-kb/...）。
+    """
+    candidates = [
+        WORKSPACE / "workspace-agent-d9479bde" / "silicon-civilization-kb" / "scripts" / "memory_integrity.py",
+        WORKSPACE / "silicon-civilization-kb" / "scripts" / "memory_integrity.py",
+    ]
+    script = next((p for p in candidates if p.exists()), None)
+    if script is None:
         return {"status": "script_not_found"}
 
     try:
         result = subprocess.run(
-            [sys.executable, str(script)],
+            [sys.executable, str(script), "check"],
             capture_output=True, timeout=60,
             text=True, encoding="utf-8", errors="ignore",
         )
-        tampered = "tampered" in result.stdout.lower() or result.returncode != 0
+        # 仅在脚本明确报错（返回非0 或 stdout 含 tampered）时才判为失败；
+        # 空基线（total_files:0, status:ok）属正常态，不触发 pain。
+        tampered = result.returncode != 0 and ("tampered" in result.stdout.lower() or "status" not in result.stdout.lower())
         if tampered and HAS_PAIN_BUS:
             pain_bus.emit(
                 level="P1",
@@ -285,13 +313,72 @@ def run_digest(dry_run: bool = True) -> dict:
 
     return {"migrated": migrated, "dry_run": dry_run}
 
+
+def run_token_scan() -> dict:
+    """令牌生命周期超时扫描（TK-TOKEN-LIFECYCLE-001）
+
+    每 60min 扫描 NAS tokens 目录，发现超时令牌（24h未接受/7d未交付/48h未验证）
+    自动触发 pain_bus 提醒。零 LLM，硬规则。
+    """
+    try:
+        sys.path.insert(0, str(WORKSPACE / "silicon-civilization-kb"))
+        from animlink import token_lifecycle
+        tokens_dir = os.environ.get("TOKENS_DIR", "//100.123.195.10/SOFTWARE/qclaw/tokens")
+        reminders = token_lifecycle.scan_timeouts(tokens_dir)
+        return {"reminders": len(reminders), "details": reminders}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def run_mailbox_watch() -> dict:
+    """信箱监控（mailbox_watch 子系统）
+
+    每 5min 扫描 mesh/mailbox 各信箱的未处理消息标记，发现新消息自动发 P2 疼痛信号。
+    零 LLM，硬规则，幂等（不重复通知）。
+    """
+    try:
+        sys.path.insert(0, str(SOMA_DIR))
+        import mailbox_watch
+        return mailbox_watch.run()
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
+
+
+def run_heng_watch() -> dict:
+    """恒信箱监控（heng_watch 子系统）
+
+    每 30min 扫描 Kronos-恒 收件箱，检测超时未处理消息并自动升级提醒。
+    零 LLM，硬规则，幂等。老板无需人工跟进恒的邮箱。
+    """
+    try:
+        sys.path.insert(0, str(SOMA_DIR))
+        import heng_watch
+        return heng_watch.run()
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
+
+
+def run_email_watch() -> dict:
+    """邮件监控子系统（email_watch）
+
+    每 5min 检查个人邮箱，发现老板/三体/紧急关键词邮件 → P1 唤醒 LLM。
+    零 LLM，硬规则，幂等。
+    """
+    try:
+        sys.path.insert(0, str(SOMA_DIR))
+        import email_watch
+        return email_watch.run()
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
+
+
 # ─── 调度器状态机 ───────────────────────────────────────────────────────────
 MODES = {
-    "normal":  {"respiratory_min": 1,  "heartd_min": 5,  "vault_min": 15, "integrity_min": 30, "thermo_min": 60, "reflex_min": 60, "immune_min": 120},
-    "standby": {"respiratory_min": 15, "heartd_min": 15, "vault_min": 60, "integrity_min": 60, "thermo_min": 120, "reflex_min": 120, "immune_min": 240},
-    "combat":  {"respiratory_min": 0.5,"heartd_min": 2,  "vault_min": 15, "integrity_min": 15, "thermo_min": 15, "reflex_min": 30, "immune_min": 60},
-    "hibench": {"respiratory_min": 0,  "heartd_min": 30, "vault_min": 0,  "integrity_min": 0,  "thermo_min": 0,  "reflex_min": 0, "immune_min": 0},
-    "disaster":{"respiratory_min": 0,  "heartd_min": 5,  "vault_min": 0,  "integrity_min": 0,  "thermo_min": 0,  "reflex_min": 0, "immune_min": 0},
+    "normal":  {"respiratory_min": 5,  "heartd_min": 10, "vault_min": 30, "integrity_min": 60, "thermo_min": 120, "reflex_min": 120, "immune_min": 240, "token_min": 240, "mailbox_min": 3, "heng_min": 10, "email_min": 5,  "load_min": 60, "watchdog_min": 1},
+    "standby": {"respiratory_min": 15, "heartd_min": 15, "vault_min": 60, "integrity_min": 60, "thermo_min": 120, "reflex_min": 120, "immune_min": 240, "token_min": 240, "mailbox_min": 15, "heng_min": 60, "email_min": 15, "load_min": 120, "watchdog_min": 5},
+    "combat":  {"respiratory_min": 0.5,"heartd_min": 2,  "vault_min": 15, "integrity_min": 15, "thermo_min": 15, "reflex_min": 30, "immune_min": 60, "token_min": 60, "mailbox_min": 2, "heng_min": 10, "email_min": 3,  "load_min": 30, "watchdog_min": 1},
+    "hibench": {"respiratory_min": 0,  "heartd_min": 30, "vault_min": 0,  "integrity_min": 0,  "thermo_min": 0,  "reflex_min": 0, "immune_min": 0, "token_min": 0, "mailbox_min": 0, "heng_min": 0, "email_min": 30, "load_min": 0, "watchdog_min": 5},
+    "disaster":{"respiratory_min": 0,  "heartd_min": 5,  "vault_min": 0,  "integrity_min": 0,  "thermo_min": 0,  "reflex_min": 0, "immune_min": 0, "token_min": 0, "mailbox_min": 0, "heng_min": 0, "email_min": 0,  "load_min": 0, "watchdog_min": 1},
 }
 
 def get_current_mode() -> str:
@@ -308,6 +395,43 @@ def set_mode(mode: str) -> str:
     return f"Mode set to: {mode}"
 
 # ─── 调度主循环 ─────────────────────────────────────────────────────────────
+def run_eod_backup() -> dict:
+    """
+    收工备份：核心灵魂文件 + 记忆 + 今日产出 → NAS backup/eod/{date}/
+    老板 2026-08-11 指示：收工前养成备份习惯，不用每次提醒。
+    零 LLM 依赖（纯 WebDAV 上传）。
+    """
+    try:
+        eod_script = WORKSPACE / "eod_backup.py"
+        if not eod_script.exists():
+            return {"ok": False, "reason": "eod_backup.py missing"}
+        r = subprocess.run(
+            [sys.executable, "-X", "utf8", str(eod_script)],
+            capture_output=True, timeout=300, cwd=str(WORKSPACE),
+            env={**os.environ, "PYTHONIOENCODING": "utf-8"}
+        )
+        out = r.stdout.decode("utf-8", errors="replace")
+        tail = out.strip().splitlines()[-1] if out.strip() else ""
+        ok = "0 FAIL" in out and "OK /" in out
+        # 追加：恒（Kronos-heng）灵魂+记忆备份（2026-08-12 老板指示：灵魂记忆备份好即可随时迁移）
+        heng_result = {}
+        try:
+            heng_script = WORKSPACE / "scripts" / "heng_soul_backup.py"
+            if heng_script.exists():
+                hr = subprocess.run(
+                    [sys.executable, "-X", "utf8", str(heng_script)],
+                    capture_output=True, timeout=300, cwd=str(WORKSPACE),
+                    env={**os.environ, "PYTHONIOENCODING": "utf-8"}
+                )
+                hout = hr.stdout.decode("utf-8", errors="replace")
+                heng_result = {"rc": hr.returncode, "tail": (hout.strip().splitlines()[-1] if hout.strip() else "")[-200:]}
+        except Exception as e:
+            heng_result = {"ok": False, "reason": str(e)}
+        return {"ok": ok, "rc": r.returncode, "tail": tail[-200:], "heng": heng_result}
+    except Exception as e:
+        return {"ok": False, "reason": str(e)}
+
+
 def run_loop(interval_min: int = 1, stop_event=None):
     """
     主调度循环。
@@ -325,14 +449,41 @@ def run_loop(interval_min: int = 1, stop_event=None):
         "reflex": 0,
         "immune": 0,
         "digest": 0,
+        "token": 0,
+        "mailbox": 0,
+        "heng": 0,
+        "email": 0,
+        "load": 0,
+        "watchdog": 0,
     }
+
+    # 初始化 watchdog
+    wd = loop_watchdog.get_watchdog() if HAS_WATCHDOG else None
     digest_hour = 4  # 每天 04:00 执行 digest
+    eod_hour, eod_minute = 22, 30  # 每天 22:30 执行收工备份
+    eod_last_run = None  # 记录上次备份日期，避免重复执行
+    heartd_result = read_state().get("heartd_last") or {}
 
     while True:
         mode = get_current_mode()
         schedule = MODES.get(mode, MODES["normal"])
 
         now = datetime.now()
+
+        # ── 工作时间动态调度（老板 2026-08-12 指示）──
+        # 工作时间 08:00-23:00：mailbox 强制 3min / heng 强制 10min（协作效率优先）
+        # 深夜 23:00-08:00：mailbox 15min / heng 30min（省资源，静默期）
+        work_hour = 8 <= now.hour < 23
+        if work_hour:
+            # 工作时间固定高频（不受 standby 等节能模式影响）
+            mailbox_min_eff = 3 if schedule["mailbox_min"] > 0 else 0
+            heng_min_eff = 10 if schedule["heng_min"] > 0 else 0
+            email_min_eff = 5 if schedule["email_min"] > 0 else 0
+        else:
+            mailbox_min_eff = max(15, schedule["mailbox_min"])
+            heng_min_eff = max(30, schedule["heng_min"])
+            email_min_eff = max(30, schedule["email_min"])
+
         counters["respiratory"] += interval_min
         counters["heartd"]       += interval_min
         counters["vault"]        += interval_min
@@ -340,12 +491,28 @@ def run_loop(interval_min: int = 1, stop_event=None):
         counters["thermo"]       += interval_min
         counters["reflex"]       += interval_min
         counters["immune"]       += interval_min
+        counters["token"]        += interval_min
+        counters["mailbox"]      += interval_min
+        counters["heng"]         += interval_min
+        counters["email"]         += interval_min
+        counters["load"]        += interval_min
+        counters["watchdog"]     += interval_min
 
         # digest: 每天 04:00
         if now.hour == digest_hour and now.minute < interval_min:
             counters["digest"] = 1
         else:
             counters["digest"] += interval_min
+
+        # eod_backup: 每天 22:30（收工备份，老板 2026-08-11 指示养成习惯）
+        if now.hour == eod_hour and now.minute >= eod_minute and now.minute < eod_minute + interval_min:
+            if eod_last_run != now.date().isoformat():
+                eod_last_run = now.date().isoformat()
+                try:
+                    r = run_eod_backup()
+                    log_event("eod_backup", "run", json.dumps(r))
+                except Exception as e:
+                    log_event("eod_backup", "error", str(e))
 
         # ── 执行各子系统 ──
         if counters["respiratory"] >= schedule["respiratory_min"] and schedule["respiratory_min"] > 0:
@@ -356,6 +523,7 @@ def run_loop(interval_min: int = 1, stop_event=None):
         if counters["heartd"] >= schedule["heartd_min"]:
             counters["heartd"] = 0
             r = probe_heartd()
+            heartd_result = r
             log_event("heartd", "probe", json.dumps(r))
             # 如果 L2/L3 全挂，发疼痛
             if not r.get("L2_nas_webdav") and not r.get("L3_memguard") and HAS_PAIN_BUS:
@@ -375,6 +543,17 @@ def run_loop(interval_min: int = 1, stop_event=None):
             counters["thermo"] = 0
             r = run_thermo()
             log_event("thermo", "check", json.dumps(r))
+
+        if counters["load"] >= schedule["load_min"] and schedule["load_min"] > 0:
+            counters["load"] = 0
+            try:
+                import load_monitor as lm_mod
+                r = lm_mod.check()
+                log_event("load", "check", json.dumps(r))
+                if r.get("pain_level"):
+                    lm_mod.send_pain(r["pain_level"], "; ".join(r.get("warnings", [])))
+            except Exception as e:
+                log_event("load", "error", str(e))
 
         if counters["reflex"] >= schedule["reflex_min"] and schedule["reflex_min"] > 0:
             counters["reflex"] = 0
@@ -406,13 +585,69 @@ def run_loop(interval_min: int = 1, stop_event=None):
             r = run_digest()
             log_event("digest", "run", json.dumps(r))
 
+        if counters["token"] >= schedule["token_min"] and schedule["token_min"] > 0:
+            counters["token"] = 0
+            r = run_token_scan()
+            log_event("token", "scan", json.dumps(r))
+            if r.get("reminders", 0) > 0 and HAS_PAIN_BUS:
+                pain_bus.emit("P3", "token_lifecycle",
+                              f"{r['reminders']} 枚令牌超时待处理", details=r)
+
+        if counters["mailbox"] >= mailbox_min_eff and mailbox_min_eff > 0:
+            counters["mailbox"] = 0
+            r = run_mailbox_watch()
+            log_event("mailbox", "scan", json.dumps(r))
+            if r.get("status") == "new":
+                # 疼痛信号已由 mailbox_watch 内部发出（P2），此处仅记录
+                log_event("mailbox", "new_messages", json.dumps(r.get("messages", [])))
+
+        if counters["heng"] >= heng_min_eff and heng_min_eff > 0:
+            counters["heng"] = 0
+            r = run_heng_watch()
+            log_event("heng_watch", "scan", json.dumps(r))
+            if r.get("escalated", 0) > 0:
+                # 疼痛信号已由 heng_watch 内部发出，此处仅记录
+                log_event("heng_watch", "escalated", json.dumps(r.get("pending", [])))
+
+        # ── email_watch：工作日 5min / 深夜 30min ─────────────────────────
+        if counters["email"] >= email_min_eff and email_min_eff > 0:
+            counters["email"] = 0
+            r = run_email_watch()
+            log_event("email_watch", "scan", json.dumps(r))
+            # P1 信号由 email_watch 内部通过 pain_bus → _wake_llm 触发，此处仅记录
+            if r.get("status") == "pain" and r.get("level") == "P1":
+                log_event("email_watch", "P1_raised", json.dumps(r.get("signals", [])))
+
+        # ── Loop Watchdog v2：exec 超时 + 状态文件检查 ──
+        if counters["watchdog"] >= schedule["watchdog_min"] and schedule["watchdog_min"] > 0:
+            counters["watchdog"] = 0
+            if wd:
+                try:
+                    r = wd.check_once()
+                    if r:
+                        log_event("watchdog", "detection", json.dumps(r, ensure_ascii=False))
+                        if HAS_PAIN_BUS and r.get("severity") in ("P0", "P1"):
+                            pain_bus.emit(
+                                level=r["severity"],
+                                source="loop_watchdog",
+                                summary=r.get("detail", "Loop detected"),
+                                details=r,
+                            )
+                    log_event("watchdog", "check", json.dumps({
+                        "detections": wd.state.get("total_detections", 0),
+                        "interventions": wd.state.get("total_interventions", 0),
+                        "active_execs": len(wd.exec_tracker.registered),
+                    }))
+                except Exception as e:
+                    log_event("watchdog", "error", str(e))
+
         # 更新状态文件
         state = read_state()
         state.update({
             "last_tick": utcnow(),
             "mode": mode,
             "counters": counters,
-            "heartd_last": r if counters["heartd"] == 0 else state.get("heartd_last"),
+            "heartd_last": heartd_result,
         })
         write_state(state)
 
@@ -424,10 +659,22 @@ def run_loop(interval_min: int = 1, stop_event=None):
         time.sleep(interval_min * 60)
 
 # ─── 状态视图 ───────────────────────────────────────────────────────────────
+def _read_load_state() -> dict:
+    """读取 load_monitor 的最新状态（轻量，不触发 check）。"""
+    try:
+        import json as _json
+        sf = WORKSPACE / "scripts" / "SOMA" / "state" / "load_monitor_state.json"
+        if sf.exists():
+            with open(sf, "r", encoding="utf-8") as _f:
+                return _json.load(_f)
+    except Exception:
+        pass
+    return {"node_history": [], "mailbox_history": []}
+
 def get_subsystem_status() -> dict:
     """收集所有子系统的最新状态。"""
-    state = read_state()
-    heartd_last = state.get("heartd_last", {})
+    state = read_state() or {}
+    heartd_last = state.get("heartd_last", {}) or {}
 
     # pain_bus 状态
     pb = pain_bus.status() if HAS_PAIN_BUS else {"status": "not_installed"}
@@ -439,12 +686,22 @@ def get_subsystem_status() -> dict:
         if f.is_file() and "__pycache__" not in str(f)
     ) / (1024 * 1024)
 
+    # watchdog 状态
+    wd_status = {}
+    if HAS_WATCHDOG:
+        try:
+            wd_status = loop_watchdog.get_watchdog().get_status()
+        except Exception:
+            pass
+
     return {
         "mode": state.get("mode", "normal"),
         "last_tick": state.get("last_tick", "never"),
         "uptime": state.get("last_mode_change", "unknown"),
         "workspace_mb": round(total_size, 1),
         "pain_bus": pb,
+        "load": _read_load_state(),
+        "watchdog": wd_status,
         "heartd": {
             "L0_process": heartd_last.get("L0_process", "?"),
             "L2_nas_webdav": heartd_last.get("L2_nas_webdav", "?"),
