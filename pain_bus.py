@@ -21,11 +21,19 @@ P4  · 微痛：单次失败 / 轻微异常 → 静默记录，可审计
 import os
 import sys
 import json
+import time
 import uuid
 import hashlib
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
+import io
+
+# ─── 强制 UTF-8 stdout（避免 GBK 控制台下打印 emoji/中文崩溃）──────────────
+if hasattr(sys.stdout, "buffer"):
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+if hasattr(sys.stderr, "buffer"):
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
 
 # ─── 路径配置 ───────────────────────────────────────────────────────────────
 WORKSPACE = Path(__file__).parent.parent.parent.resolve()
@@ -33,9 +41,36 @@ SOMA_DIR  = WORKSPACE / "scripts" / "SOMA"
 PAIN_DIR  = SOMA_DIR  / "pain_signals"
 LOG_FILE  = SOMA_DIR  / "pain_log.jsonl"
 CHECKPOINT_DIR = SOMA_DIR / "checkpoints"
+STATE_FILE = SOMA_DIR / "pain_state.json"
 
 for _d in (PAIN_DIR, CHECKPOINT_DIR):
     _d.mkdir(parents=True, exist_ok=True)
+
+# ─── SOMA→LLM 唤醒桥（TK-SOMA-WAKE-001）─────────────────────────────────────
+# ⚠️ 端口动态探测：gateway 每次升级端口会变（58213→58243 等），从 openclaw.json 读真实端口
+import json as _json, os as _os, re as _re
+
+def _detect_gateway_port() -> int:
+    """从 openclaw.json 读取 gateway 端口（失败回退 58243）。"""
+    candidates = [
+        _os.path.expanduser("~/.qclaw/openclaw.json"),
+        _os.path.expanduser("~/.openclaw/openclaw.json"),
+    ]
+    for path in candidates:
+        try:
+            with open(path, encoding="utf-8") as f:
+                cfg = _json.load(f)
+            port = cfg.get("port") or (cfg.get("server") or {}).get("port")
+            if port:
+                return int(port)
+        except Exception:
+            continue
+    return 58243  # 默认回退
+
+HOOK_PORT = _detect_gateway_port()
+HOOK_URL = f"http://127.0.0.1:{HOOK_PORT}/hooks/wake"
+HOOK_TOKEN = _os.environ.get("SOMA_HOOK_TOKEN", "soma-wake-20260812-9f4e2c7a")
+WAKE_COOLDOWN_SECONDS = 300  # 5 分钟防风暴：P1 在冷却期内降级 next-heartbeat
 
 # ─── 疼痛等级定义 ───────────────────────────────────────────────────────────
 PAIN_LEVELS = {
@@ -54,7 +89,8 @@ CORE_FILES = [
 
 # ─── 工具函数 ──────────────────────────────────────────────────────────────
 def utcnow() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S+08:00")
+    """真实 UTC 时间（ISO8601，Z 后缀；符合时区统一规范，与 time.time() 一致）。"""
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 def compute_hash(filepath: Path) -> str:
     h = hashlib.sha256()
@@ -102,6 +138,89 @@ def create_checkpoint(note: str = "") -> Path:
 
     return cp_dir
 
+# ─── SOMA→LLM 唤醒桥（TK-SOMA-WAKE-001）─────────────────────────────────────
+def _load_state() -> dict:
+    """读取 pain_bus 状态（last_wake_ts 等）。"""
+    try:
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _save_state(state: dict) -> None:
+    try:
+        with open(STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(state, f, ensure_ascii=False, indent=2)
+    except OSError:
+        pass
+
+
+def _wake_llm(text: str, mode: str = "now") -> bool:
+    """唤醒 LLM 主会话（POST gateway hooks/wake）。
+
+    零依赖（urllib 标准库），3 秒超时，异常静默捕获不崩 pain_bus。
+    返回是否成功；失败写 pain_log.jsonl。
+    """
+    import urllib.request
+    body = json.dumps({"text": text, "mode": mode}).encode("utf-8")
+    req = urllib.request.Request(
+        HOOK_URL, data=body, method="POST",
+        headers={"Authorization": f"Bearer {HOOK_TOKEN}",
+                 "Content-Type": "application/json"},
+    )
+    ok = False
+    try:
+        with urllib.request.urlopen(req, timeout=3) as resp:
+            ok = 200 <= resp.status < 300
+    except Exception as exc:  # 异常静默捕获：不崩 pain_bus
+        try:
+            with open(LOG_FILE, "a", encoding="utf-8") as f:
+                f.write(json.dumps({
+                    "event": "wake_llm_error", "error": str(exc),
+                    "mode": mode, "timestamp": utcnow(),
+                }, ensure_ascii=False) + "\n")
+        except OSError:
+            pass
+    return ok
+
+
+# ─── 去重配置 ──────────────────────────────────────────────────────────────
+DEDUP_WINDOW_SECONDS = 3600  # 1 小时内同源同摘要不重复发射
+
+def _is_duplicate(source: str, summary: str) -> Optional[str]:
+    """检查是否已有同源同摘要的近期信号。返回已有 pain_id 或 None。"""
+    if not PAIN_DIR.exists():
+        return None
+    now = time.time()
+    for f in PAIN_DIR.iterdir():
+        if f.suffix != '.json' or f.name.startswith('.'):
+            continue
+        try:
+            with open(f, 'r', encoding='utf-8') as fh:
+                sig = json.load(fh)
+            sig_source = sig.get('source', '')
+            sig_summary = sig.get('summary', '') or sig.get('detail', '')
+            sig_ts = sig.get('timestamp') or sig.get('ts') or ''
+            if sig_source != source:
+                continue
+            # 摘要完全匹配或包含匹配
+            if summary not in sig_summary and sig_summary not in summary:
+                continue
+            # 检查时间窗口
+            if sig_ts:
+                try:
+                    ts_clean = sig_ts.replace('Z', '+00:00')
+                    sig_time = datetime.fromisoformat(ts_clean).timestamp()
+                    if now - sig_time < DEDUP_WINDOW_SECONDS:
+                        return sig.get('pain_id', f.stem)
+                except (ValueError, TypeError):
+                    pass
+        except (json.JSONDecodeError, OSError):
+            pass
+    return None
+
+
 # ─── 疼痛信号发射 ───────────────────────────────────────────────────────────
 def emit(
     level: str,
@@ -125,6 +244,19 @@ def emit(
         checkpoint_note:  快照备注
     返回：pain_id 字符串
     """
+    # 去重：同源同摘要在窗口期内不重复发射
+    existing_id = _is_duplicate(source, summary)
+    if existing_id:
+        try:
+            with open(LOG_FILE, 'a', encoding='utf-8') as f:
+                f.write(json.dumps({
+                    'event': 'emit_dedup', 'existing_id': existing_id,
+                    'source': source, 'summary': summary, 'timestamp': utcnow(),
+                }, ensure_ascii=False) + '\n')
+        except OSError:
+            pass
+        return existing_id
+
     if level not in PAIN_LEVELS:
         raise ValueError(f"Unknown pain level: {level}")
 
@@ -164,6 +296,29 @@ def emit(
     with open(LOG_FILE, "a", encoding="utf-8") as f:
         f.write(json.dumps(log_entry, ensure_ascii=False) + "\n")
 
+    # ★ SOMA→LLM 唤醒桥（TK-SOMA-WAKE-001）：P0/P1 触发主动唤醒，大脑响应
+    if info["wake_llm"]:
+        state = _load_state()
+        mode = "now"
+        last_ts = state.get("last_wake_ts")
+        if level == "P1" and last_ts:
+            try:
+                if time.time() - datetime.fromisoformat(last_ts).timestamp() < WAKE_COOLDOWN_SECONDS:
+                    mode = "next-heartbeat"  # 防风暴：5 分钟内已唤醒，P1 降级
+            except (ValueError, TypeError):
+                pass
+        wake_ok = _wake_llm(summary, mode=mode)
+        state["last_wake_ts"] = utcnow()
+        _save_state(state)
+        try:
+            with open(LOG_FILE, "a", encoding="utf-8") as f:
+                f.write(json.dumps({
+                    "event": "wake_llm", "ok": wake_ok, "mode": mode,
+                    "pain_id": pain_id, "level": level, "timestamp": utcnow(),
+                }, ensure_ascii=False) + "\n")
+        except OSError:
+            pass
+
     return pain_id
 
 # ─── 查询待处理疼痛信号 ─────────────────────────────────────────────────────
@@ -184,6 +339,11 @@ def check_pending(min_level: str = "P4") -> list:
         try:
             with open(f, "r", encoding="utf-8") as fh:
                 sig = json.load(fh)
+            # 归一化兼容字段：部分子系统写 "level"/"ts" 而非 "pain_level"/"timestamp"
+            if "pain_level" not in sig and "level" in sig:
+                sig["pain_level"] = sig["level"]
+            if "timestamp" not in sig and "ts" in sig:
+                sig["timestamp"] = sig["ts"]
             lvl_priority = PAIN_LEVELS.get(sig.get("pain_level", "P4"), {}).get("priority", 99)
             if lvl_priority <= threshold:
                 pending.append(sig)
@@ -224,8 +384,8 @@ def status() -> dict:
     return {
         "status": "running",
         "pending_count": len(pending),
-        "worst_level": worst["pain_level"] if worst else None,
-        "worst_summary": worst["summary"] if worst else None,
+        "worst_level": (worst.get("pain_level") or worst.get("level")) if worst else None,
+        "worst_summary": (worst.get("summary") or worst.get("detail") or "") if worst else None,
         "checkpoint_count": cp_count,
         "log_lines": sum(1 for _ in open(LOG_FILE, "r", encoding="utf-8", errors="ignore").readlines()) if LOG_FILE.exists() else 0,
     }
@@ -272,7 +432,10 @@ if __name__ == "__main__":
         if not pending:
             print("No pending pain signals.")
         for s in pending:
-            print(f"  [{s['pain_level']}] {s['timestamp']} {s['source']}: {s['summary']}")
+            lvl = s.get('pain_level') or s.get('level') or 'P4'
+            ts = s.get('timestamp') or s.get('ts') or '?'
+            src = s.get('source') or s.get('subsystem') or '?'
+            print(f"  [{lvl}] {ts} {src}: {s.get('summary', '')}")
 
     elif args.cmd == "clear":
         ok = clear(args.pain_id, args.reason)
