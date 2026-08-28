@@ -1,39 +1,6 @@
 {
-  "active": [
-    {
-      "id": "goal_003",
-      "title": "自主目标引擎实现",
-      "type": "推进型",
-      "source": "内生驱动",
-      "priority": "P1",
-      "status": "active",
-      "created": "2026-08-27T01:19:01Z",
-      "success_criteria": "goal_tracker.py 可用 + HEARTBEAT 集成",
-      "context": "老板指示：自主定义目标必须要实现",
-      "deadline": "",
-      "attempts": 0,
-      "max_attempts": 3,
-      "notes": [],
-      "activated": "2026-08-27T01:19:09Z"
-    }
-  ],
-  "backlog": [
-    {
-      "id": "goal_001",
-      "title": "Anima Lineage M1 DID 集成",
-      "type": "推进型",
-      "source": "工程驱动",
-      "priority": "P2",
-      "status": "pending",
-      "created": "2026-08-27T01:18:42Z",
-      "success_criteria": "DID 文档包含 lineage 字段",
-      "context": "genesis/chain/kinship 已完成，DID 集成是 M1 最后一步",
-      "deadline": "",
-      "attempts": 0,
-      "max_attempts": 3,
-      "notes": []
-    }
-  ],
+  "active": [],
+  "backlog": [],
   "completed": [
     {
       "id": "goal_002",
@@ -51,11 +18,100 @@
       "notes": [],
       "completed": "2026-08-27T01:19:01Z",
       "result": "pain_bus.py emit() 新增 _is_duplicate 去重函数，1h 窗口期内同源同摘要跳过。48→1 signals。commit ff3b4f4"
+    },
+    {
+      "id": "goal_003",
+      "title": "自主目标引擎实现",
+      "type": "推进型",
+      "source": "内生驱动",
+      "priority": "P1",
+      "status": "completed",
+      "created": "2026-08-27T01:19:01Z",
+      "success_criteria": "goal_tracker.py 可用 + HEARTBEAT 集成",
+      "context": "老板指示：自主定义目标必须要实现",
+      "deadline": "",
+      "attempts": 0,
+      "max_attempts": 3,
+      "notes": [],
+      "activated": "2026-08-27T01:19:09Z",
+      "completed": "2026-08-27T01:22:58Z",
+      "result": "goal_tracker.py 实现完成：CRUD + lifecycle + gather_state + identify_goals + HEARTBEAT.md 集成。commit 26f6440。Phase 2 达成。"
+    },
+    {
+      "id": "goal_004",
+      "title": "Polaris M0 后端联调确认",
+      "type": "推进型",
+      "source": "工程驱动·M0 路线图 8/28 联调日",
+      "priority": "P1",
+      "status": "completed",
+      "created": "2026-08-28T01:24:22Z",
+      "success_criteria": "",
+      "context": "",
+      "deadline": "",
+      "attempts": 0,
+      "max_attempts": 3,
+      "notes": [],
+      "activated": "2026-08-28T01:24:31Z",
+      "completed": "2026-08-28T01:27:52Z",
+      "result": "M0 后端全通：Auth ✅ / Instance CRUD ✅ / Check 需 baseline（正常） / History/Report/Trend ✅"
+    },
+    {
+      "id": "goal_006",
+      "title": "清理陈旧 pain signals",
+      "type": "维护型",
+      "source": "内生驱动·pain_bus 积压",
+      "priority": "P3",
+      "status": "completed",
+      "created": "2026-08-28T01:31:16Z",
+      "success_criteria": "",
+      "context": "",
+      "deadline": "",
+      "attempts": 0,
+      "max_attempts": 3,
+      "notes": [],
+      "activated": "2026-08-28T01:32:10Z",
+      "completed": "2026-08-28T01:32:10Z",
+      "result": "无陈旧信号"
+    },
+    {
+      "id": "goal_005",
+      "title": "自主目标引擎 Phase 3：心跳驱动自动执行维护型目标",
+      "type": "推进型",
+      "source": "工程驱动·自治能力升级",
+      "priority": "P1",
+      "status": "completed",
+      "created": "2026-08-28T01:28:20Z",
+      "success_criteria": "",
+      "context": "",
+      "deadline": "",
+      "attempts": 0,
+      "max_attempts": 3,
+      "notes": [],
+      "activated": "2026-08-28T01:28:27Z",
+      "completed": "2026-08-28T01:32:49Z",
+      "result": "Phase 3 实现完成：auto_execute_maintenance() + 4 个白名单动作 + CLI auto/maint 命令 + HEARTBEAT.md 集成"
+    },
+    {
+      "id": "goal_001",
+      "title": "Anima Lineage M1 DID 集成",
+      "type": "推进型",
+      "source": "工程驱动",
+      "priority": "P2",
+      "status": "completed",
+      "created": "2026-08-27T01:18:42Z",
+      "success_criteria": "DID 文档包含 lineage 字段",
+      "context": "genesis/chain/kinship 已完成，DID 集成是 M1 最后一步",
+      "deadline": "",
+      "attempts": 0,
+      "max_attempts": 3,
+      "notes": [],
+      "completed": "2026-08-28T01:47:32Z",
+      "result": "DID 文档 lineage 字段注入完成：multi_instance.py 新增 load_lineage_data() + _create_instance_did_document 支持 lineage_data 参数 + .lineage/genesis.json + chain.jsonl 初始化"
     }
   ],
   "metadata": {
     "created": "2026-08-27T01:18:42Z",
     "version": "1.0",
-    "updated": "2026-08-27T01:19:09Z"
+    "updated": "2026-08-28T01:47:32Z"
   }
 }

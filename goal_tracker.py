@@ -335,6 +335,178 @@ def identify_goals_from_state(state: dict) -> List[dict]:
     return suggestions
 
 
+# ─── Phase 3: 维护型目标自动执行 ─────────────────────────────────────────────
+
+# 安全白名单：只有这些维护动作可以自动执行
+MAINTENANCE_ACTIONS = {
+    "clean_stale_signals": {
+        "desc": "清理陈旧 pain signals",
+        "cmd": "clean_stale",
+        "risk": "low",
+    },
+    "check_health": {
+        "desc": "SOMA 健康检查",
+        "cmd": "health",
+        "risk": "low",
+    },
+    "check_nas": {
+        "desc": "NAS 可用性检测",
+        "cmd": "nas_check",
+        "risk": "low",
+    },
+    "check_email": {
+        "desc": "邮箱新邮件检查",
+        "cmd": "email_check",
+        "risk": "low",
+    },
+}
+
+
+def auto_execute_maintenance() -> dict:
+    """
+    Phase 3 核心：心跳驱动自动执行维护型目标。
+    
+    规则：
+    1. 只执行 status=pending, goal_type=维护型 的目标
+    2. 只执行 MAINTENANCE_ACTIONS 白名单内的动作
+    3. 每次执行记录到 AUTONOMY_LOG.md
+    4. 返回 {"executed": [...], "skipped": [...]}
+    """
+    goals = _load_goals()
+    result = {"executed": [], "skipped": [], "errors": []}
+
+    # 找到所有 pending 的维护型目标
+    pending_maintenance = [
+        g for g in goals.get("backlog", []) + goals.get("active", [])
+        if g.get("status") == "pending" and g.get("type") == "维护型"
+    ]
+
+    if not pending_maintenance:
+        return result
+
+    for goal in pending_maintenance:
+        gid = goal["id"]
+        title = goal["title"]
+
+        # 匹配白名单动作
+        matched_action = None
+        for action_key, action_info in MAINTENANCE_ACTIONS.items():
+            if action_key in title or action_info["desc"] in title:
+                matched_action = action_key
+                break
+
+        if not matched_action:
+            result["skipped"].append({"id": gid, "title": title, "reason": "no_matching_action"})
+            continue
+
+        action_info = MAINTENANCE_ACTIONS[matched_action]
+
+        # 执行
+        try:
+            exec_result = _execute_maintenance_action(matched_action, action_info)
+            result["executed"].append({
+                "id": gid,
+                "title": title,
+                "action": matched_action,
+                "result": exec_result,
+            })
+            # 标记完成
+            activate_goal(gid)
+            complete_goal(gid, result=exec_result)
+            _log_autonomy(
+                action=f"auto_execute:{matched_action}",
+                source="phase3_heartbeat",
+                detail=f"{title}",
+                result=exec_result,
+            )
+        except Exception as e:
+            result["errors"].append({"id": gid, "title": title, "error": str(e)})
+            _log_autonomy(
+                action=f"auto_execute_error:{matched_action}",
+                source="phase3_heartbeat",
+                detail=f"{title}",
+                result=f"ERROR: {e}",
+            )
+
+    return result
+
+
+def _execute_maintenance_action(action_key: str, action_info: dict) -> str:
+    """执行单个维护动作，返回结果描述。"""
+    import subprocess
+
+    soma_dir = str(SOMA_DIR)
+
+    if action_key == "clean_stale_signals":
+        # 统计并清理陈旧 pain signals
+        sig_dir = SOMA_DIR / "pain_signals"
+        stale = [f for f in sig_dir.glob("pain_*.json") if f.stat().st_mtime < time.time() - 86400]
+        if not stale:
+            return "无陈旧信号"
+        archive = sig_dir / f"archive_{today().replace('-', '')}"
+        archive.mkdir(exist_ok=True)
+        import shutil
+        for f in stale:
+            shutil.move(str(f), str(archive / f.name))
+        return f"归档 {len(stale)} 条陈旧信号"
+
+    elif action_key == "check_health":
+        r = subprocess.run(
+            [sys.executable, "-X", "utf8", soma_dir + "/autonomic_master.py", "health"],
+            capture_output=True, timeout=15, text=True, encoding="utf-8", errors="replace",
+        )
+        return r.stdout.strip()[:200]
+
+    elif action_key == "check_nas":
+        try:
+            import urllib.request
+            r = urllib.request.urlopen(
+                "http://100.123.195.10:5005/qclaw/",
+                timeout=5,
+            )
+            return f"NAS WebDAV: {r.status}"
+        except Exception as e:
+            return f"NAS WebDAV: {type(e).__name__}"
+
+    elif action_key == "check_email":
+        r = subprocess.run(
+            [sys.executable, "-X", "utf8", soma_dir + "/email_watch.py", "run"],
+            capture_output=True, timeout=30, text=True, encoding="utf-8", errors="replace",
+        )
+        return r.stdout.strip()[:200]
+
+    return f"未实现: {action_key}"
+
+
+def suggest_maintenance_goals() -> list:
+    """基于当前状态建议维护型目标。"""
+    suggestions = []
+
+    # 检查是否有陈旧 pain signals
+    sig_dir = SOMA_DIR / "pain_signals"
+    if sig_dir.exists():
+        stale = [f for f in sig_dir.glob("pain_*.json") if f.stat().st_mtime < time.time() - 86400]
+        if len(stale) > 10:
+            suggestions.append({
+                "title": f"清理 {len(stale)} 条陈旧 pain signals",
+                "goal_type": "维护型",
+                "priority": "P3",
+                "source": "内生驱动·pain_bus 积压",
+            })
+
+    # 检查 workspace 大小
+    ws_size = sum(f.stat().st_size for f in WORKSPACE.rglob("*") if f.is_file()) / (1024*1024)
+    if ws_size > 300:
+        suggestions.append({
+            "title": f"workspace 体积检查（{ws_size:.0f}MB）",
+            "goal_type": "维护型",
+            "priority": "P3",
+            "source": "内生驱动·资源水位",
+        })
+
+    return suggestions
+
+
 # ─── CLI ────────────────────────────────────────────────────────────────────
 def _cli():
     import argparse
@@ -378,6 +550,12 @@ def _cli():
 
     # suggest
     sub.add_parser("suggest", help="基于当前状态建议目标")
+
+    # auto (Phase 3)
+    sub.add_parser("auto", help="自动执行维护型目标（Phase 3）")
+
+    # maint (Phase 3)
+    sub.add_parser("maint", help="建议维护型目标")
 
     args = parser.parse_args()
 
@@ -426,6 +604,21 @@ def _cli():
             print("No suggestions. System healthy.")
         for s in suggestions:
             print(f"  [{s['priority']}] {s['type']} | {s['title']}")
+
+    elif args.cmd == "auto":
+        r = auto_execute_maintenance()
+        if not r["executed"] and not r["skipped"] and not r["errors"]:
+            print("No pending maintenance goals.")
+        else:
+            import json as _json
+            print(_json.dumps(r, ensure_ascii=False, indent=2))
+
+    elif args.cmd == "maint":
+        suggestions = suggest_maintenance_goals()
+        if not suggestions:
+            print("No maintenance suggestions. System healthy.")
+        for s in suggestions:
+            print(f"  [{s['priority']}] {s['goal_type']} | {s['title']}")
 
     else:
         parser.print_help()
